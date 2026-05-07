@@ -12,7 +12,7 @@ from tkinter import font as tkfont
 from PIL import Image, ImageTk
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
-STREAM_URL  = "http://10.44.61.132:81/stream"  # replace with your ESP32 camera stream URL
+STREAM_URL  = "http://10.44.61.132:81/stream"
 COM_PORT    = "COM6"
 BAUD_RATE   = 115200
 current_bpm = 90   # default BPM, should match ESP32 initial value
@@ -146,12 +146,8 @@ alt_state = {
 }
 
 def build_bounce_sequence(active_finger_indices):
-    n = len(active_finger_indices)
-    if n <= 1:
-        return active_finger_indices[:]
-    up   = list(range(n))
-    down = list(range(n - 2, 0, -1))
-    return up + down
+    # Simple forward cycle to match ESP32 behavior: 1,2,3,1,2,3
+    return list(range(len(active_finger_indices)))
 
 def update_alt_state(new_fingers):
     prev = alt_state["active_fingers"]
@@ -177,7 +173,8 @@ def current_playing_finger():
 
 def advance_alt_note(now, bpm):
     seq = alt_state["sequence"]
-    if len(seq) <= 1:
+    af = alt_state["active_fingers"]
+    if len(af) <= 1:
         return
     interval = 60.0 / max(40, bpm)
     if now - alt_state["last_tick"] >= interval:
@@ -423,10 +420,17 @@ tk.Label(status_row,
          text=f"{COM_PORT} connected" if serial_connected else "Serial not found",
          font=small_fnt, bg=PANEL_BG, fg=TEXT_SEC).pack(side="left", padx=6)
 
+def quit_app(e=None):
+    if ser:
+        ser.write(b"NOHANDS\n")
+        ser.write(b"NOHANDS\n")
+        time.sleep(0.3)
+    root.destroy()
+
 tk.Button(right_frame, text="Quit  [q]", font=small_fnt,
            bg=PANEL_BG, fg=TEXT_SEC, activebackground=BORDER,
            relief="flat", bd=0, cursor="hand2",
-           command=root.destroy).pack(pady=(4,14))
+           command=quit_app).pack(pady=(4,14))
 
 # ── Main update loop ──────────────────────────────────────────────────────────
 photo_ref = None
@@ -438,7 +442,7 @@ def update():
 
     ret, frame = cap.read()
     if not ret:
-        root.after(30, update)
+        root.after(50, update)
         return
 
     frame     = cv2.flip(frame, 1)
@@ -482,6 +486,7 @@ def update():
             ser.write(f"F:{f_str},BPM:{bpm},KEY:{current_scale_var.get()}\n".encode())
         else:
             ser.write(f"F:{f_str},BPM:{current_bpm},KEY:{current_scale_var.get()}\n".encode())
+            # print(f"Sending: F:{f_str},BPM:{bpm},KEY:{current_scale_var.get()}") # monitoring serial packet sent
 
     print(f"Fingers: {f_str} | BPM: {current_bpm} | Key: {current_scale_var.get()}")
 
@@ -494,8 +499,11 @@ def update():
         else:
             led_canvases[i].itemconfig(led_circles[i], fill=LED_OFF)
 
-    # ── Update piano ───────────────────────────────────────────────────────────
-    build_piano(right_fingers, playing_finger=playing_fi)
+    # ── Update piano (only redraw if state changed) ────────────────────────────
+    new_piano_state = (tuple(right_fingers), playing_fi)
+    if new_piano_state != getattr(update, 'last_piano_state', None):
+        build_piano(right_fingers, playing_finger=playing_fi)
+        update.last_piano_state = new_piano_state
 
     # ── Update labels ──────────────────────────────────────────────────────────
     finger_disp = "  ".join(list(f_str))
@@ -528,12 +536,12 @@ def update():
     photo_ref = ImageTk.PhotoImage(image=Image.fromarray(display))
     cam_canvas.create_image(0, 0, anchor="nw", image=photo_ref)
 
-    root.after(30, update)
+    root.after(50, update)
 
-root.bind("<q>", lambda e: root.destroy())
-root.bind("<Q>", lambda e: root.destroy())
+root.bind("<q>", quit_app)
+root.bind("<Q>", quit_app)
 
-root.after(0, update)
+root.after(50, update)
 root.mainloop()
 
 cap.release()
