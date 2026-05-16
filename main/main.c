@@ -1,201 +1,336 @@
+#include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "driver/i2s.h"
+#include "driver/uart.h"
+#include "freertos/semphr.h"
+#include "driver/gptimer.h"
+#include "driver/gpio.h"
 #include "esp_log.h"
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "nvs_flash.h"
-#include "esp_netif.h"
-#include "esp_http_server.h"
-#include "esp_camera.h"
-#include "esp_timer.h"
 
-static const char *TAG = "xiao_camera";
+static const char *TAG = "invisible_piano";
 
-// ---- CHANGE THESE ----
-#define WIFI_SSID      "Berkeley-IoT"
-#define WIFI_PASSWORD  "TheMisfit!1"
-// ----------------------
+// I2S pins
+#define I2S_NUM I2S_NUM_0
+#define I2S_BCLK 27
+#define I2S_LRC 25
+#define I2S_DOUT 26
 
-// XIAO ESP32S3 Sense camera pins
-#define CAM_PIN_PWDN    -1
-#define CAM_PIN_RESET   -1
-#define CAM_PIN_XCLK    10
-#define CAM_PIN_SIOD    40
-#define CAM_PIN_SIOC    39
-#define CAM_PIN_D7      48
-#define CAM_PIN_D6      11
-#define CAM_PIN_D5      12
-#define CAM_PIN_D4      14
-#define CAM_PIN_D3      16
-#define CAM_PIN_D2      18
-#define CAM_PIN_D1      17
-#define CAM_PIN_D0      15
-#define CAM_PIN_VSYNC   38
-#define CAM_PIN_HREF    47
-#define CAM_PIN_PCLK    13
+// Audio settings
+#define SAMPLE_RATE 20000
+#define BUFFER_SIZE 512
+#define NOTE_DURATION_MS 200
+#define NOTE_SAMPLES ((SAMPLE_RATE * NOTE_DURATION_MS) / 1000)
 
-static EventGroupHandle_t wifi_event_group;
-#define WIFI_CONNECTED_BIT BIT0
+// UART settings
+#define UART_NUM UART_NUM_0
+#define UART_BUF_SIZE 1024
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base,
-                               int32_t event_id, void *event_data)
+static volatile bool finger_down[5] = {false, false, false, false, false};
+static volatile bool audio_enabled = true;
+static volatile int current_bpm = 90;
+static int global_note_index = 0;
+static int16_t note_buffers[5][NOTE_SAMPLES * 2];
+
+static QueueHandle_t uart_event_queue;
+static gptimer_handle_t beat_timer = NULL;
+static SemaphoreHandle_t beat_semaphore = NULL;
+
+// Scale definitions
+static const float SCALES[6][5] = {
+    {261.63f, 293.66f, 329.63f, 349.23f, 392.00f}, // C major
+    {392.00f, 440.00f, 493.88f, 523.25f, 587.33f}, // G major
+    {293.66f, 329.63f, 369.99f, 392.00f, 440.00f}, // D major
+    {440.00f, 493.88f, 554.37f, 587.33f, 659.25f}, // A major
+    {349.23f, 392.00f, 440.00f, 466.16f, 523.25f}, // F major
+    {466.16f, 523.25f, 587.33f, 622.25f, 698.46f}, // Bb major
+};
+
+static const char *SCALE_NAMES[6] = {
+    "C major", "G major", "D major", "A major", "F major", "Bb major"
+};
+
+static float current_notes[5] = {261.63f, 293.66f, 329.63f, 349.23f, 392.00f};
+
+// ============================================================
+// INTERRUPT #1 — Hardware timer ISR (gptimer)
+// Fires once per beat, signals audio_task via semaphore
+// ============================================================
+static bool IRAM_ATTR on_alarm_cb(gptimer_handle_t timer,
+                                   const gptimer_alarm_event_data_t *edata,
+                                   void *user_ctx)
 {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        esp_wifi_connect();
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        ESP_LOGI(TAG, "Camera Ready! Use 'http://" IPSTR "' to connect",
-                 IP2STR(&event->ip_info.ip));
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
-    }
+    BaseType_t higher_priority_woken = pdFALSE;
+    xSemaphoreGiveFromISR(beat_semaphore, &higher_priority_woken);
+    return higher_priority_woken == pdTRUE;
 }
 
-static void wifi_init(void)
+static void i2s_init(void)
 {
-    wifi_event_group = xEventGroupCreate();
-
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-
-    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
-    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASSWORD,
-        },
+    i2s_config_t i2s_config = {
+        .mode = I2S_MODE_MASTER | I2S_MODE_TX,
+        .sample_rate = SAMPLE_RATE,
+        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
+        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
+        .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+        .intr_alloc_flags = 0,
+        .dma_buf_count = 8,
+        .dma_buf_len = BUFFER_SIZE,
+        .use_apll = false,
+        .tx_desc_auto_clear = true,
     };
 
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
-
-    xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT,
-                        false, true, portMAX_DELAY);
-}
-
-static esp_err_t camera_init(void)
-{
-    camera_config_t config = {
-        .pin_pwdn     = CAM_PIN_PWDN,
-        .pin_reset    = CAM_PIN_RESET,
-        .pin_xclk     = CAM_PIN_XCLK,
-        .pin_sccb_sda = CAM_PIN_SIOD,
-        .pin_sccb_scl = CAM_PIN_SIOC,
-        .pin_d7       = CAM_PIN_D7,
-        .pin_d6       = CAM_PIN_D6,
-        .pin_d5       = CAM_PIN_D5,
-        .pin_d4       = CAM_PIN_D4,
-        .pin_d3       = CAM_PIN_D3,
-        .pin_d2       = CAM_PIN_D2,
-        .pin_d1       = CAM_PIN_D1,
-        .pin_d0       = CAM_PIN_D0,
-        .pin_vsync    = CAM_PIN_VSYNC,
-        .pin_href     = CAM_PIN_HREF,
-        .pin_pclk     = CAM_PIN_PCLK,
-        .xclk_freq_hz = 20000000,
-        .ledc_timer   = LEDC_TIMER_0,
-        .ledc_channel = LEDC_CHANNEL_0,
-        .pixel_format = PIXFORMAT_JPEG,
-        .frame_size   = FRAMESIZE_QVGA,
-        .jpeg_quality = 12,
-        .fb_count     = 2,
-        .grab_mode    = CAMERA_GRAB_LATEST,
-        .fb_location  = CAMERA_FB_IN_PSRAM,
+    i2s_pin_config_t pin_config = {
+        .bck_io_num = I2S_BCLK,
+        .ws_io_num = I2S_LRC,
+        .data_out_num = I2S_DOUT,
+        .data_in_num = I2S_PIN_NO_CHANGE,
     };
 
-    esp_err_t err = esp_camera_init(&config);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Camera init failed: 0x%x", err);
-        return err;
-    }
-
-    // Flip camera orientation
-    sensor_t *s = esp_camera_sensor_get();
-    s->set_vflip(s, 1);
-    s->set_hmirror(s, 1);
-
-    ESP_LOGI(TAG, "Camera initialized");
-    return ESP_OK;
+    i2s_driver_install(I2S_NUM, &i2s_config, 0, NULL);
+    i2s_set_pin(I2S_NUM, &pin_config);
+    ESP_LOGI(TAG, "I2S initialized");
 }
 
-// Stream handler — sends MJPEG stream
-static esp_err_t stream_handler(httpd_req_t *req)
+static void generate_note_buffers(void)
 {
-    camera_fb_t *fb = NULL;
-    esp_err_t res = ESP_OK;
-    char part_buf[64];
+    for (int i = 0; i < 5; i++) {
+        float phase = 0.0f;
+        float phase_step = 2.0f * M_PI * current_notes[i] / SAMPLE_RATE;
 
-    res = httpd_resp_set_type(req, "multipart/x-mixed-replace;boundary=frame");
-    if (res != ESP_OK) return res;
-
-    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-
-    while (true) {
-        fb = esp_camera_fb_get();
-        if (!fb) {
-            ESP_LOGE(TAG, "Camera capture failed");
-            res = ESP_FAIL;
-            break;
+        for (int j = 0; j < NOTE_SAMPLES; j++) {
+            float sample = sinf(phase);
+            float envelope = 1.0f;
+            if (j > NOTE_SAMPLES * 0.8f) {
+                envelope = (float)(NOTE_SAMPLES - j) / (NOTE_SAMPLES * 0.2f);
+            }
+            int16_t out = (int16_t)(sample * envelope * 16000);
+            note_buffers[i][j * 2]     = out;
+            note_buffers[i][j * 2 + 1] = out;
+            phase += phase_step;
+            if (phase > 2.0f * M_PI) phase -= 2.0f * M_PI;
         }
-
-        size_t hlen = snprintf(part_buf, sizeof(part_buf),
-                               "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                               fb->len);
-
-        res = httpd_resp_send_chunk(req, part_buf, hlen);
-        if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
-        }
-        if (res == ESP_OK) {
-            res = httpd_resp_send_chunk(req, "\r\n", 2);
-        }
-
-        esp_camera_fb_return(fb);
-        fb = NULL;
-
-        if (res != ESP_OK) break;
     }
-
-    return res;
 }
 
-static void start_webserver(void)
+static void update_bpm_timer(int bpm)
 {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.server_port = 81;
+    gptimer_alarm_config_t alarm_cfg = {
+        .alarm_count = (uint64_t)(60000000ULL / bpm),
+        .reload_count = 0,
+        .flags.auto_reload_on_alarm = true,
+    };
+    gptimer_stop(beat_timer);
+    gptimer_set_alarm_action(beat_timer, &alarm_cfg);
+    gptimer_start(beat_timer);
+    ESP_LOGI(TAG, "BPM updated to %d", bpm);
+}
 
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t stream_uri = {
-            .uri      = "/stream",
-            .method   = HTTP_GET,
-            .handler  = stream_handler,
-            .user_ctx = NULL,
-        };
-        httpd_register_uri_handler(server, &stream_uri);
-        ESP_LOGI(TAG, "Stream server started on port 81");
+static void parse_message(const char *msg)
+{
+    // ============================================================
+    // INTERRUPT #5 — No hands detected
+    // NOHANDS message disables audio output
+    // ============================================================
+    if (strncmp(msg, "NOHANDS", 7) == 0) {
+        if (audio_enabled) {
+            audio_enabled = false;
+            i2s_zero_dma_buffer(I2S_NUM);
+            ESP_LOGI(TAG, "No hands detected - audio off");
+        }
+        return;
+    }
+
+    audio_enabled = true;
+
+    // ============================================================
+    // INTERRUPT #2 — Finger state change
+    // Triggers note on or note off when finger state changes
+    // ============================================================
+    const char *f_ptr = strstr(msg, "F:");
+    if (f_ptr) {
+        f_ptr += 2;
+        for (int i = 0; i < 5; i++) {
+            if (f_ptr[i] == '1' || f_ptr[i] == '0') {
+                bool new_state = (f_ptr[i] == '1');
+                if (new_state != finger_down[i]) {
+                    finger_down[i] = new_state;
+                    ESP_LOGI(TAG, "Finger %d %s (%.2f Hz)",
+                             i, new_state ? "DOWN (note on)" : "UP (note off)",
+                             current_notes[i]);
+                }
+            }
+        }
+    }
+
+    // ============================================================
+    // INTERRUPT #3 — BPM threshold crossed
+    // Updates timer interval when BPM changes significantly
+    // ============================================================
+    const char *bpm_ptr = strstr(msg, "BPM:");
+    if (bpm_ptr) {
+        bpm_ptr += 4;
+        int new_bpm = atoi(bpm_ptr);
+        new_bpm = (new_bpm < 40) ? 40 : (new_bpm > 200) ? 200 : new_bpm;
+
+        if (abs(new_bpm - current_bpm) > 2) {
+            current_bpm = new_bpm;
+            update_bpm_timer(current_bpm);
+        }
+    }
+
+    // ============================================================
+    // INTERRUPT #4 — Key change
+    // Changes list of note frequencies when user changes key in GUI
+    // ============================================================
+    const char *key_ptr = strstr(msg, "KEY:");
+    if (key_ptr) {
+        key_ptr += 4;
+        for (int s = 0; s < 6; s++) {
+            if (strstr(key_ptr, SCALE_NAMES[s]) != NULL) {
+                for (int n = 0; n < 5; n++) {
+                    current_notes[n] = SCALES[s][n];
+                }
+                generate_note_buffers();
+                ESP_LOGI(TAG, "Scale changed to: %s", SCALE_NAMES[s]);
+                break;
+            }
+        }
+    }
+
+    ESP_LOGI(TAG, "Fingers: %d%d%d%d%d | BPM: %d",
+             (int)finger_down[0], (int)finger_down[1], (int)finger_down[2],
+             (int)finger_down[3], (int)finger_down[4], current_bpm);
+}
+
+static void uart_task(void *arg)
+{
+    uart_event_t event;
+    uint8_t data[UART_BUF_SIZE];
+    char line[UART_BUF_SIZE];
+    int line_pos = 0;
+
+    while (1) {
+        if (xQueueReceive(uart_event_queue, &event, portMAX_DELAY)) {
+            if (event.type == UART_DATA) {
+                int len = uart_read_bytes(UART_NUM, data, event.size,
+                                          pdMS_TO_TICKS(20));
+                for (int i = 0; i < len; i++) {
+                    char c = (char)data[i];
+                    if (c == '\n') {
+                        line[line_pos] = '\0';
+                        if (line_pos > 0) {
+                            parse_message(line);
+                        }
+                        line_pos = 0;
+                    } else if (line_pos < UART_BUF_SIZE - 1) {
+                        line[line_pos++] = c;
+                    }
+                }
+            } else if (event.type == UART_FIFO_OVF ||
+                       event.type == UART_BUFFER_FULL) {
+                uart_flush_input(UART_NUM);
+                xQueueReset(uart_event_queue);
+                ESP_LOGW(TAG, "UART overflow - buffer flushed");
+            }
+        }
+    }
+}
+
+static void audio_task(void *arg)
+{
+    size_t bytes_written;
+
+    while (1) {
+        // Interrupt #4 — silence when no hands
+        if (!audio_enabled) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Build list of active fingers
+        int active_fingers[5];
+        int active_count = 0;
+        for (int f = 0; f < 5; f++) {
+            if (finger_down[f]) {
+                active_fingers[active_count++] = f;
+            }
+        }
+
+        if (active_count == 0) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
+        // Wait for hardware timer ISR beat signal (Interrupt #1)
+        xSemaphoreTake(beat_semaphore, portMAX_DELAY);
+
+        // Flush extra beats that queued while busy
+        while (xSemaphoreTake(beat_semaphore, 0) == pdTRUE) {}
+
+        ESP_LOGI(TAG, "Timer Fired");
+
+        // Advance through active notes
+        int finger_index = active_fingers[global_note_index % active_count];
+        global_note_index++;
+        if (global_note_index > 1000000) global_note_index = 0;
+
+        // Play pre-generated note buffer
+        int total_bytes = NOTE_SAMPLES * 2 * sizeof(int16_t);
+        uint8_t *buf = (uint8_t *)note_buffers[finger_index];
+        int written = 0;
+        while (written < total_bytes && audio_enabled) {
+            int chunk = 512;
+            if (written + chunk > total_bytes) chunk = total_bytes - written;
+            i2s_write(I2S_NUM, buf + written, chunk, &bytes_written, portMAX_DELAY);
+            written += bytes_written;
+        }
+        if (!audio_enabled) {
+            i2s_zero_dma_buffer(I2S_NUM);
+        }
     }
 }
 
 void app_main(void)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES ||
-        ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase();
-        nvs_flash_init();
-    }
+    ESP_LOGI(TAG, "Invisible Piano starting...");
 
-    camera_init();
-    wifi_init();
-    start_webserver();
+    beat_semaphore = xSemaphoreCreateBinary();
+
+    // Configure gptimer (Interrupt #1)
+    gptimer_config_t config = {
+        .clk_src = GPTIMER_CLK_SRC_DEFAULT,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = 1000000,
+        .intr_priority = 3,
+    };
+    gptimer_new_timer(&config, &beat_timer);
+
+    gptimer_event_callbacks_t cbs = {
+        .on_alarm = on_alarm_cb,
+    };
+    gptimer_register_event_callbacks(beat_timer, &cbs, NULL);
+
+    gptimer_alarm_config_t alarm_config = {
+        .alarm_count = (uint64_t)(60000000ULL / current_bpm),
+        .reload_count = 0,
+        .flags.auto_reload_on_alarm = true,
+    };
+    gptimer_set_alarm_action(beat_timer, &alarm_config);
+    gptimer_enable(beat_timer);
+    gptimer_start(beat_timer);
+
+    // UART with event queue (feeds Interrupts #2, #3, #4, #5)
+    uart_driver_install(UART_NUM, UART_BUF_SIZE * 2, 0, 20,
+                        &uart_event_queue, 0);
+
+    i2s_init();
+    generate_note_buffers();
+
+    xTaskCreatePinnedToCore(audio_task, "audio_task", 4096, NULL, 6, NULL, 0);
+    xTaskCreatePinnedToCore(uart_task,  "uart_task",  4096, NULL, 5, NULL, 1);
+
+    ESP_LOGI(TAG, "Tasks started");
 }
