@@ -1,5 +1,3 @@
 idf_component_register(SRCS "main.c"
                         INCLUDE_DIRS "."
-                        REQUIRES driver)
-
-target_link_libraries(${COMPONENT_LIB} m)
+                        REQUIRES espressif__esp32-camera esp_wifi esp_http_server nvs_flash esp_netif esp_timer)
